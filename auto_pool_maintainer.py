@@ -8,7 +8,9 @@ import asyncio
 import base64
 import csv
 import datetime as dt
+import email as email_lib
 import hashlib
+import imaplib
 import json
 import logging
 import os
@@ -568,6 +570,89 @@ def wait_for_verification_code_duckmail(
     return None
 
 
+def create_temp_email_icloud(
+    email_domains: List[str],
+    logger: logging.Logger,
+) -> tuple[Optional[str], Optional[str]]:
+    chars = string.ascii_lowercase + string.digits
+    length = random.randint(10, 14)
+    local_part = "".join(random.choice(chars) for _ in range(length))
+    domain = random.choice(email_domains) if email_domains else "franxx.ai"
+    email_addr = f"{local_part}@{domain}"
+    logger.info("iCloud Catch-All 生成邮箱: %s", email_addr)
+    return email_addr, "icloud"
+
+
+def wait_for_verification_code_icloud(
+    target_email: str,
+    imap_host: str,
+    imap_port: int,
+    imap_user: str,
+    imap_pass: str,
+    timeout: int = 120,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[str]:
+    start = time.time()
+    seen_uids: set[str] = set()
+    while time.time() - start < timeout:
+        conn = None
+        try:
+            conn = imaplib.IMAP4_SSL(imap_host, imap_port)
+            conn.login(imap_user, imap_pass)
+            conn.select("INBOX")
+
+            search_criteria = f'(TO "{target_email}" FROM "openai.com")'
+            status, msg_ids = conn.search(None, search_criteria)
+            if status != "OK" or not msg_ids or not msg_ids[0]:
+                status, msg_ids = conn.search(None, f'(TO "{target_email}")')
+
+            if status == "OK" and msg_ids and msg_ids[0]:
+                uid_list = msg_ids[0].split()
+                for uid in reversed(uid_list):
+                    uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
+                    if uid_str in seen_uids:
+                        continue
+                    seen_uids.add(uid_str)
+                    _, msg_data = conn.fetch(uid, "(BODY[])")
+                    if not msg_data or not msg_data[0]:
+                        continue
+                    raw_email = msg_data[0][1] if isinstance(msg_data[0], tuple) else None
+                    if not raw_email:
+                        continue
+                    msg = email_lib.message_from_bytes(raw_email)
+                    body = ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            ct = part.get_content_type()
+                            if ct in ("text/html", "text/plain"):
+                                payload = part.get_payload(decode=True)
+                                if payload:
+                                    charset = part.get_content_charset() or "utf-8"
+                                    body += payload.decode(charset, errors="replace")
+                    else:
+                        payload = msg.get_payload(decode=True)
+                        if payload:
+                            charset = msg.get_content_charset() or "utf-8"
+                            body = payload.decode(charset, errors="replace")
+                    if body:
+                        code = extract_verification_code(body)
+                        if code:
+                            if logger:
+                                logger.info("iCloud IMAP 收到验证码: %s (email=%s)", code, target_email)
+                            return code
+            conn.logout()
+        except Exception as e:
+            if logger:
+                logger.warning("iCloud IMAP 轮询异常: %s", e)
+            if conn:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        time.sleep(3)
+    return None
+
+
 class ProtocolRegistrar:
     def __init__(self, proxy: str, logger: logging.Logger):
         self.session = create_session(proxy=proxy)
@@ -796,6 +881,10 @@ class ProtocolRegistrar:
         redirect_uri: str,
         email_provider: str = "cloudflare",
         duckmail_api_base: str = "",
+        icloud_imap_host: str = "imap.mail.me.com",
+        icloud_imap_port: int = 993,
+        icloud_username: str = "",
+        icloud_app_password: str = "",
     ) -> bool:
         first_name, last_name = generate_random_name()
         birthdate = generate_random_birthday()
@@ -811,7 +900,16 @@ class ProtocolRegistrar:
             self.logger.warning("注册失败: step3_send_otp | email=%s", email)
             return False
         mail_session = create_session()
-        if email_provider == "duckmail":
+        if email_provider == "icloud":
+            code = wait_for_verification_code_icloud(
+                target_email=email,
+                imap_host=icloud_imap_host,
+                imap_port=icloud_imap_port,
+                imap_user=icloud_username,
+                imap_pass=icloud_app_password,
+                logger=self.logger,
+            )
+        elif email_provider == "duckmail":
             code = wait_for_verification_code_duckmail(mail_session, duckmail_api_base, cf_token)
         else:
             code = wait_for_verification_code(mail_session, worker_domain, cf_token)
@@ -870,6 +968,10 @@ def perform_codex_oauth_login_http(
     proxy: str,
     email_provider: str = "cloudflare",
     duckmail_api_base: str = "",
+    icloud_imap_host: str = "imap.mail.me.com",
+    icloud_imap_port: int = 993,
+    icloud_username: str = "",
+    icloud_app_password: str = "",
 ) -> Optional[Dict[str, Any]]:
     session = create_session(proxy=proxy)
     device_id = str(uuid.uuid4())
@@ -962,7 +1064,7 @@ def perform_codex_oauth_login_http(
         return None
 
     if page_type == "email_otp_verification" or "email-verification" in continue_url:
-        if not cf_token:
+        if email_provider != "icloud" and not cf_token:
             return None
 
         mail_session = create_session(proxy=proxy)
@@ -975,7 +1077,33 @@ def perform_codex_oauth_login_http(
         h_val.update(generate_datadog_trace())
 
         code = None
-        while time.time() - start_time < 120:
+
+        if email_provider == "icloud":
+            icloud_code = wait_for_verification_code_icloud(
+                target_email=email,
+                imap_host=icloud_imap_host,
+                imap_port=icloud_imap_port,
+                imap_user=icloud_username,
+                imap_pass=icloud_app_password,
+            )
+            if icloud_code:
+                resp_val = session.post(
+                    f"{oauth_issuer}/api/accounts/email-otp/validate",
+                    json={"code": icloud_code},
+                    headers=h_val,
+                    verify=False,
+                    timeout=30,
+                )
+                if resp_val.status_code == 200:
+                    code = icloud_code
+                    try:
+                        data = resp_val.json()
+                        continue_url = str(data.get("continue_url") or "")
+                        page_type = str(((data.get("page") or {}).get("type")) or "")
+                    except Exception:
+                        pass
+
+        while not code and email_provider != "icloud" and time.time() - start_time < 120:
             if email_provider == "duckmail":
                 all_emails = fetch_emails_duckmail(mail_session, duckmail_api_base, cf_token)
             else:
@@ -1325,6 +1453,12 @@ class RegisterRuntime:
         self.duckmail_api_base = str(conf.get("duckmail_api_base", "https://api.duckmail.sbs") or "https://api.duckmail.sbs")
         self.duckmail_bearer = str(conf.get("duckmail_bearer", "") or "")
 
+        icloud_cfg = conf.get("icloud") if isinstance(conf.get("icloud"), dict) else {}
+        self.icloud_imap_host = str(icloud_cfg.get("imap_host", "imap.mail.me.com") or "imap.mail.me.com")
+        self.icloud_imap_port = int(icloud_cfg.get("imap_port", 993) or 993)
+        self.icloud_username = str(icloud_cfg.get("username", "") or "")
+        self.icloud_app_password = str(icloud_cfg.get("app_password", "") or "")
+
         self.oauth_issuer = str(pick_conf(conf, "oauth", "issuer", default="https://auth.openai.com") or "https://auth.openai.com")
         self.oauth_client_id = str(
             pick_conf(conf, "oauth", "client_id", default="app_EMoamEEZ73f0CkXaXp7hrann") or "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -1604,6 +1738,10 @@ class RegisterRuntime:
                 proxy=self.proxy,
                 email_provider=self.email_provider,
                 duckmail_api_base=self.duckmail_api_base,
+                icloud_imap_host=self.icloud_imap_host,
+                icloud_imap_port=self.icloud_imap_port,
+                icloud_username=self.icloud_username,
+                icloud_app_password=self.icloud_app_password,
             )
             if tokens:
                 return tokens
@@ -1621,7 +1759,12 @@ def register_one(runtime: RegisterRuntime, worker_id: int = 0) -> tuple[Optional
     t_start = time.time()
     session = create_session(proxy=runtime.proxy)
 
-    if runtime.email_provider == "duckmail":
+    if runtime.email_provider == "icloud":
+        email, cf_token = create_temp_email_icloud(
+            email_domains=runtime.email_domains,
+            logger=runtime.logger,
+        )
+    elif runtime.email_provider == "duckmail":
         email, cf_token = create_temp_email_duckmail(
             session,
             duckmail_api_base=runtime.duckmail_api_base,
@@ -1650,6 +1793,10 @@ def register_one(runtime: RegisterRuntime, worker_id: int = 0) -> tuple[Optional
         redirect_uri=runtime.oauth_redirect_uri,
         email_provider=runtime.email_provider,
         duckmail_api_base=runtime.duckmail_api_base,
+        icloud_imap_host=runtime.icloud_imap_host,
+        icloud_imap_port=runtime.icloud_imap_port,
+        icloud_username=runtime.icloud_username,
+        icloud_app_password=runtime.icloud_app_password,
     )
     t_reg = time.time() - t_start
     if not reg_ok:
@@ -1688,7 +1835,12 @@ def run_batch_register(conf: Dict[str, Any], target_tokens: int, logger: logging
         return 0, 0, 0
 
     email_provider = str(pick_conf(conf, "email", "provider", default="cloudflare") or "cloudflare").lower()
-    if email_provider == "duckmail":
+    if email_provider == "icloud":
+        icloud_cfg = conf.get("icloud") if isinstance(conf.get("icloud"), dict) else {}
+        if not icloud_cfg.get("username") or not icloud_cfg.get("app_password"):
+            logger.error("icloud.username 或 icloud.app_password 未配置。")
+            return 0, 0, 0
+    elif email_provider == "duckmail":
         if not conf.get("duckmail_bearer", ""):
             logger.error("duckmail_bearer 未配置，无法创建 DuckMail 临时邮箱。")
             return 0, 0, 0
@@ -1706,7 +1858,9 @@ def run_batch_register(conf: Dict[str, Any], target_tokens: int, logger: logging
         workers,
         runtime.email_provider,
     )
-    if runtime.email_provider == "duckmail":
+    if runtime.email_provider == "icloud":
+        logger.info("iCloud IMAP: %s@%s, 域名=%s", runtime.icloud_username, runtime.icloud_imap_host, ",".join(runtime.email_domains))
+    elif runtime.email_provider == "duckmail":
         logger.info("DuckMail API: %s", runtime.duckmail_api_base)
     else:
         logger.info("Worker域名=%s, 邮箱后缀=%s", runtime.worker_domain, ",".join(runtime.email_domains))
