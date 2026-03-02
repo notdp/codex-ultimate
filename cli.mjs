@@ -10,6 +10,8 @@ import { execSync, spawn } from "node:child_process";
 const GITHUB_REPO = "https://github.com/notdp/codex-ultimate.git";
 const CONFIG_DIR = path.join(os.homedir(), ".codex-ultimate");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const PID_PATH = path.join(CONFIG_DIR, "daemon.pid");
+const LOG_DIR = path.join(CONFIG_DIR, "logs");
 const PYTHON_CMD = "codex-pool-maintainer";
 
 function loadConfig() {
@@ -235,9 +237,9 @@ async function install() {
   );
 }
 
-// ── run ───────────────────────────────────────────────────────
+// ── run (foreground) ──────────────────────────────────────────
 
-async function run() {
+function ensureReady() {
   if (!fs.existsSync(CONFIG_PATH)) {
     console.error(
       pc.red("未找到配置文件: ") +
@@ -247,7 +249,6 @@ async function run() {
     );
     process.exit(1);
   }
-
   if (!hasPythonCmd()) {
     console.error(
       pc.red(`未找到 ${PYTHON_CMD} 命令。`) +
@@ -257,10 +258,81 @@ async function run() {
     );
     process.exit(1);
   }
+}
 
+async function run() {
+  ensureReady();
   const args = ["--config", CONFIG_PATH, ...process.argv.slice(3)];
   const child = spawn(PYTHON_CMD, args, { stdio: "inherit" });
   child.on("close", (code) => process.exit(code ?? 1));
+}
+
+// ── start (daemon) ───────────────────────────────────────────
+
+function readPid() {
+  try {
+    const pid = parseInt(fs.readFileSync(PID_PATH, "utf-8").trim(), 10);
+    if (isNaN(pid)) return null;
+    try { process.kill(pid, 0); return pid; } catch { return null; }
+  } catch { return null; }
+}
+
+async function start() {
+  ensureReady();
+
+  const existing = readPid();
+  if (existing) {
+    console.log(pc.yellow(`已有进程运行中 (PID: ${existing})，先执行 stop 再启动。`));
+    process.exit(1);
+  }
+
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const logFile = path.join(LOG_DIR, `daemon_${ts}.log`);
+  const out = fs.openSync(logFile, "a");
+  const err = fs.openSync(logFile, "a");
+
+  const args = ["--config", CONFIG_PATH, "--log-dir", LOG_DIR, ...process.argv.slice(3)];
+  const child = spawn(PYTHON_CMD, args, {
+    detached: true,
+    stdio: ["ignore", out, err],
+  });
+  child.unref();
+
+  fs.writeFileSync(PID_PATH, String(child.pid), "utf-8");
+  console.log(pc.green(`已启动后台进程 (PID: ${child.pid})`));
+  console.log(pc.dim(`日志: ${logFile}`));
+}
+
+// ── stop ─────────────────────────────────────────────────────
+
+async function stop() {
+  const pid = readPid();
+  if (!pid) {
+    console.log(pc.yellow("没有运行中的后台进程。"));
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+    console.log(pc.green(`已停止进程 (PID: ${pid})`));
+  } catch (e) {
+    console.log(pc.red(`停止失败: ${e.message}`));
+  }
+  try { fs.unlinkSync(PID_PATH); } catch {}
+}
+
+// ── status ───────────────────────────────────────────────────
+
+async function status() {
+  const pid = readPid();
+  if (pid) {
+    console.log(pc.green(`运行中 (PID: ${pid})`));
+  } else {
+    console.log(pc.dim("未运行"));
+    if (fs.existsSync(PID_PATH)) {
+      try { fs.unlinkSync(PID_PATH); } catch {}
+    }
+  }
 }
 
 // ── entry ─────────────────────────────────────────────────────
@@ -271,14 +343,23 @@ if (cmd === "install") {
   install();
 } else if (cmd === "run") {
   run();
+} else if (cmd === "start") {
+  start();
+} else if (cmd === "stop") {
+  stop();
+} else if (cmd === "status") {
+  status();
 } else {
   console.log(`
   ${pc.bold("codex-ultimate")}
 
   ${pc.cyan("npx codex-ultimate install")}   交互式配置 + 安装 Python 依赖
-  ${pc.cyan("npx codex-ultimate run")}       运行账号池维护
+  ${pc.cyan("npx codex-ultimate run")}       前台运行
+  ${pc.cyan("npx codex-ultimate start")}     后台运行（守护进程）
+  ${pc.cyan("npx codex-ultimate stop")}      停止后台进程
+  ${pc.cyan("npx codex-ultimate status")}    查看运行状态
 
-  run 后可追加参数，例如:
-    npx codex-ultimate run --min-candidates 10
+  run / start 后可追加参数，例如:
+    npx codex-ultimate start --min-candidates 10
 `);
 }
