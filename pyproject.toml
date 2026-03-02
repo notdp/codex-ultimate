@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-ultimate"
+version = "1.0.0"
+description = "OpenAI Codex account pool auto-maintainer"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "requests>=2.31",
+]
+
+[project.scripts]
+codex-pool-maintainer = "pool_maintainer.app:main"
+
+[tool.setuptools.packages.find]
+include = ["pool_maintainer*"]

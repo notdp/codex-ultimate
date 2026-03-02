@@ -12,9 +12,9 @@ from .utils import get_candidates_count, parse_bool, set_ssl_verify
 
 
 def parse_args() -> argparse.Namespace:
-    project_dir = Path(__file__).resolve().parent.parent
-    default_cfg = project_dir / "config.json"
-    default_log_dir = project_dir / "logs"
+    config_dir = Path.home() / ".codex-ultimate"
+    default_cfg = config_dir / "config.json"
+    default_log_dir = config_dir / "logs"
 
     parser = argparse.ArgumentParser(description="账号池自动维护（三合一：清理+补号+收敛）")
     parser.add_argument("--config", default=str(default_cfg), help="统一配置文件路径")

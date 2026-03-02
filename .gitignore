@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
+*.egg-info/
+dist/
+build/
 logs/
 output_fixed/
 output_tokens/
 config.json
+node_modules/

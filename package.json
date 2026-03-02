@@ -1,0 +1,16 @@
+{
+  "name": "codex-ultimate",
+  "version": "1.0.0",
+  "description": "OpenAI Codex account pool auto-maintainer",
+  "type": "module",
+  "bin": {
+    "codex-ultimate": "./cli.mjs"
+  },
+  "scripts": {
+    "start": "node cli.mjs"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.0.1",
+    "picocolors": "^1.1.1"
+  }
+}
